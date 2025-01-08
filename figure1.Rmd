@@ -1,0 +1,512 @@
+---
+title: "Figure 1 R code"
+author: "Justin M. Leach, PhD"
+output: 
+  html_document:
+    number_sections: TRUE
+    toc: TRUE
+    toc_depth: 3
+    toc_float: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This `R` code reproduces the simulated data set used to produce Figure 1 of our manuscript *"Handling rescue therapy in Myasthenia Gravis clinical trials: why it matters and why you should care"* and additionally contains details on the mathematical models used to simulate the data set. Once the paper is published, we will provide the link. 
+
+# Simulation setting
+
+## High-level approach
+
+We first generate "complete" data, i.e., without censoring. Then we impose informative censoring on that data. This way we can compare what we "would have observed" in the absence of censoring to what we see if we (i) have censoring and (ii) handle it various (simple) ways. I have tried to keep things as simple as possible.
+
+## Model for uncensored data
+
+We assume the following linear mixed model:
+
+$$
+y_{ij} = \beta_0 + b_{0i} + t_{ij}\beta_1 + t_{ij}b_{1i} + x\beta_2 + xt\beta_3 + \epsilon_{ij}
+$$
+where variables are  defined as:
+
+- $y_{ij}$: MG-ADL for patient $i$ at time $j$.
+- $t_{ij}$: time of measurement in months for patient $i$ at time $j$.
+- $x \in \{0, 1\}$: a treatment indicator.
+
+The parameters are defined as follows:
+
+- $\beta_0$: population-level intercept for MG-ADL.
+- $b_{0i} \sim \mathcal{N}(0, \sigma^2_0)$: random intercept for patient $i$.
+- $\beta_1$: slope of MG-ADL for those on control.
+- $b_{1i} \sim \mathcal{N}(0, \sigma^2_1)$: random slope for patient $i$.
+- $\beta_2$: increment in intercept for those on treatment.
+- $\beta_3$: additional increment in slope for those on active treatment.
+- $\epsilon_i  \sim \mathcal{N}(0, \sigma^2)$: random error for patient $i$ at time $j$.
+
+For $\mathbf{b}_i = [b_{0i},b_{1i}]$ we have:
+
+$$
+\text{var}(\mathbf{b}_i) = \begin{bmatrix}
+  \sigma_0^2 & \sigma_r \\
+  \sigma_r & \sigma_1^2 \\
+\end{bmatrix}
+$$
+where $\sigma_r$ is the random effects covariance. 
+
+## Model for rescue therapy (informative censoring)
+
+In the interest of simplicity, we will only censor at the final visit, which allows us to use a logistic regression model for the probability of censoring. We make this a function of both treatment indicator and the last MG-ADL measure, $y_{i3}$:
+
+$$
+\text{logit}(\pi_i) = \alpha + x\theta_1 + y_{i3}\theta_2
+$$
+The parameters are defined as follows:
+
+- $\pi_i$: the probability of being censored at visit 3 for patient $i$.
+- $\alpha$: the log-odds of being censored at visit 3 for those in the control group with MG-ADL of 0 at visit 3.
+- $\theta_1$: increment in log-odds of being censored at visit 3 for active treatment versus control, "adjusting" for MG-ADL value at visit 3.
+- $\theta_2$: increment in log-odds of being censored at visit 3 for every 1-unit increase in MG-ADL value at visit 3, adjusting for treatment group. 
+
+# Simulation
+
+## Packages
+
+```{r, warning=FALSE}
+library(MASS)
+library(nlme)
+library(ggplot2)
+```
+
+## Design matrix 
+
+We use the following function to construct design matrices for fixed and random effects for a 2-level treatment or exposure. 
+
+```{r}
+build_design_matrix <- function(
+    N_t, # number of subjects receiving treatment
+    N_c, # number of subjects receiving control
+    K, # number of repeated measurements
+    time_start = 0, # integer that defines start of time
+    time_increment = 1, # how much time between observations? 
+    interaction = TRUE, # include interaction term?
+    num_binary_covariates = 0, # draw from Bernoulli distribution
+    success_probs = 0.5, # vector of success probabilities binary covariates
+    num_continuous_covariates = 0, # draw from N(0, 1) distribution
+    return_type = "matrix" # "matrix" or "data.frame"
+){
+  N <- N_t + N_c
+  subj_id <- rep(1:N, each = K)
+  x <- rep(
+    c(rep(1, N_t),
+      rep(0, N_c)),
+    each = K
+  )
+  time <- time_increment*rep(time_start:(time_start + (K - 1)), N)
+  if (num_binary_covariates < 0 | num_continuous_covariates < 0) {
+    warning(
+      "Require # of covariates >= 0. No covariates added. \n")
+  }
+  if (interaction == TRUE) {
+    x_mat <- cbind(
+      intercept = 1, x = x, time = time, x_by_time = x*time
+    )
+  } else {
+    x_mat <- cbind(
+      intercept = 1, x = x, time = time
+    )
+  }
+  if (num_binary_covariates > 0) {
+    if (!(length(success_probs) %in% c(1, num_binary_covariates))) {
+      stop("Require # of success probs == 1 or == num_binary_covariates.")
+    }
+    binary_list <- list()
+    if (num_binary_covariates > 1 & length(success_probs) == 1) {
+      success_probs <- rep(success_probs, num_binary_covariates)
+    }
+    for (i in 1:num_binary_covariates) {
+      binary_list[[i]] <- rep(
+        rbinom(n = N_t + N_c, size = 1, prob = success_probs[i]), each = K
+      )
+    }
+    binary_mat <- do.call(cbind, binary_list)
+    colnames(binary_mat) <- paste0("BC_", 1:num_binary_covariates)
+    x_mat <- cbind(x_mat, binary_mat)
+  }
+  if (num_continuous_covariates > 0) {
+    continuous_list <- list()
+    for (i in 1:num_continuous_covariates) {
+      continuous_list[[i]] <- rep(
+        rnorm(n = N_t + N_c), each = K,
+      )
+    }
+    continuous_mat <- do.call(cbind, continuous_list)
+    colnames(continuous_mat) <- paste0("CC_", 1:num_continuous_covariates)
+    x_mat <- cbind(x_mat, continuous_mat)
+  }
+  if (return_type == "matrix") {
+    return(x_mat)
+  } else {
+    return(
+      as.data.frame(
+        cbind(subj_id = rep(1:(N_t + N_c), each = K), x_mat)
+      )
+    )
+  }
+}
+```
+
+## Simulating uncensored data
+
+The population intercept is set to $\beta_0 = 10$. We set all fixed-effect slope parameters to be negative, but with the treatment group being more so, i.e., improving at a much faster rate. Due to RCT scenario, $\beta_2 = 0$, i.e., both groups should start in the same place on average. We impose a slight negative correlation between random effects.
+
+```{r}
+#set.seed(16767)
+#set.seed(2553267)
+set.seed(6745509)
+
+# sample size
+nt <- 50
+nc <- 50
+n <- nt + nc
+k <- 3
+
+# fixed effects design matrix
+x_mat <- build_design_matrix(
+  N_t = nt,
+  N_c = nc,
+  K = k,
+  time_increment = 3
+)
+
+# random effect design matrix
+z_mat <- x_mat[, c("x", "time")]
+
+# parameter values
+
+## intercept
+beta0 <- 10
+## slope for control group
+beta1 <- -1/6
+## treatment indicator
+beta2 <- 0
+## additional increment in slope for treatment group
+beta3 <- -1/2
+## fixed effects parameters
+beta <- c(beta0, beta1, beta2, beta3)
+## random intercept sd
+sigma0 <- 2.15
+## random slope sd
+sigma1 <- 1/4
+## random error variance
+sigma <- 2
+## random effects covariance
+sigmar <- -1/8
+## random effects covariance
+sigmab <- matrix(
+  c(sigma0^2, sigmar, sigmar, sigma1^2),
+  byrow = TRUE,
+  nrow = 2.15
+)
+## random effect correlation matrix
+cov2cor(sigmab)
+## random error covariance
+sigmae <- diag(1,k)*sigma^2
+## var(y)
+sigmami <- z_mat[1:3,] %*% sigmab %*% t(z_mat[1:3, ]) + sigmae
+sigmam <- Matrix::bdiag(
+  replicate(
+    n = n,
+    expr = sigmami,
+    simplify = FALSE
+  )
+)
+
+# draw from MVN
+y <- floor(MASS::mvrnorm(
+  n = 1,
+  mu = x_mat %*% beta,
+  Sigma = sigmam
+))
+table(y)
+hist(y)
+y <- ifelse(y < 0, 0, y)
+table(y)
+df <- as.data.frame(cbind(x_mat[, -1], y))
+df$patient <- rep(1:n, each = 3)
+head(df)
+table(df$y[df$time == 0])
+table(df$y[df$time == 3])
+table(df$y[df$time == 6])
+hist(df$y[df$time == 0])
+hist(df$y[df$time == 3])
+hist(df$y[df$time == 6])
+```
+
+## Imposing informative censoring/missingness
+
+Increases in the final follow-up MG-ADL measure increase in the odds of censoring, i.e., $\theta_2 > 0$. That is, those who are less healthy (higher MG-ADL) are more likely to be censored. For simplicity, we have set $\theta_1 = 0$.
+
+```{r}
+# reproduce
+set.seed(5019785)
+# design matrix
+x_mat_ic <- cbind(1, as.matrix(df[df$time == 6, c("x", "y")]))
+# parameter vector
+theta <- c(
+  alpha = -2.5,
+  theta1 = 0,
+  theta2 = 0.175
+)
+# probabilities of censoring
+p_ic <- plogis(x_mat_ic %*% theta)
+table(sort(round(p_ic, 3)))
+hist(p_ic)
+# observed censoring
+ic <- rbinom(n = n, size = 1, prob = p_ic)
+table(ic)
+
+# data
+df$ic <- rep(ic, each = k)
+df$yc <- ifelse(df$ic == 1 & df$time == 6, df$y*0.5, df$y)
+```
+
+# Analyzing data
+
+We have produced a scenario in which:
+
+1. The original uncensored analysis, i.e., what we would observe if no one received rescue therapy is closest to the "true" treatment effect. This has $\hat{\beta}_3 = -0.4100$ and $p = 0.0001$.
+2. The worst performance is when we ignore censoring when patients have had rescue therapy and thus their observed final MG-ADL differs from what it would have been if they had not received rescue therapy. This has $\hat{\beta}_3 = -0.1867$ and $p = 0.1049$.
+3. Somewhere in between is the analysis that simply excludes those who had rescue therapy. This has $\hat{\beta}_3 = -0.3337$ and $p = 0.0036$.
+
+## Rates of rescue therapy
+
+```{r}
+df <- df |>
+  dplyr::mutate(
+    ic_factor = factor(
+      dplyr::case_when(
+        ic == 1 ~ "Yes Rescue Therapy",
+        ic == 0 ~ "No Rescue Therapy"
+      ),
+      levels = c("Yes Rescue Therapy",
+                 "No Rescue Therapy")
+    ),
+    x_factor = factor(
+      dplyr::case_when(
+        x == 1 ~ "Treatment",
+        x == 0 ~ "Control"
+      ),
+      levels = c("Treatment",
+                 "Control")
+    )
+  )
+table(df$ic_factor)
+prop.table(table(df$ic_factor))
+table(df$ic_factor, df$x_factor)
+prop.table(table(df$ic_factor, df$x_factor), margin = 2)
+```
+
+## Logistic regression: rescue therapy/censoring model
+
+```{r}
+lr_censor <- glm(
+  data = df[df$time == 6, ],
+  formula = ic ~ y,
+  family = binomial(link = "logit")
+)
+summary(lr_censor)
+```
+
+## LMM: No rescue therapy or censoring
+
+```{r}
+lme_no_censor <- lme(
+  data = df,
+  fixed = y ~ x + time + x:time,
+  random = ~ 1 + time | patient
+)
+summary(lme_no_censor)
+```
+
+## LMM: Ignore rescue therapy
+
+```{r}
+lme_ici <- lme(
+  data = df,
+  fixed = yc ~ x + time + x:time,
+  random = ~ 1 + time | patient
+)
+summary(lme_ici)
+```
+
+## LMM: Exclude those with rescue therapy
+
+```{r}
+lme_ice <- lme(
+  data = df[!(df$ic == 1 & df$time == 6),],
+  fixed = y ~ x + time + x:time,
+  random = ~ 1 + time | patient
+)
+summary(lme_ice)
+```
+
+# Figure
+
+## Objective
+
+The primary objective is to show the population average trajectories for both treatment groups under the various analysis approaches. Here, we suppress `R` code in `HTML`; see `Rmd` file for details.
+
+## Explanation/interpretation
+
+Here we use linear mixed models to produce estimated trajectories in MG-ADL for active treatment and control groups using the same simulated data set. The treatment effect is the interaction term between time and treatment group, i.e., the more that the two trajectories depart from each other over time, the greater the treatment effect. This is a simulated data set with $N = 100$ patients who have planned baseline, 3-month, and 6-month MG-ADL measurements.
+
+- In the left panel, we have the estimated trajectories in the circumstance that no rescue therapy is administered. We can see that the treatment group improves much more rapidly on average compared to the control group, and the estimated treatment effect is $\hat{\beta}_3 = -0.4100$ with $p = 0.0001$. This is what we should reproduce in a "good" estimator of a hypothetical estimand.
+- Next, we allow some patients to receive rescue therapy after the 3-month follow-up but prior to the 6-month follow-up (24\%). To approximate the effect of rescue therapy on MG-ADL, we reduce their 6-month follow-up MG-ADL value by 50\%, which means we assume rescue therapy will improve their MG-ADL. The middle and right panels display two different approaches to handling the analysis in the presence of rescue therapy. 
+     - In the middle panel, we analyze the data while ignoring information regarding rescue therapy. While the trajectory for the treatment group is similar to the case when no rescue therapy is administered, the control group improves at a more similar rate to the treatment group compared to when no one received rescue therapy. This amounts to estimating a treatment policy estimand. The treatment effect estimate is shrunk to $\hat{\beta}_3 = -0.1867$ and the p-value raised to $p = 0.1049 > 0.05$. 
+     - In the right panel, we exclude those with rescue therapy from the analysis, which offers some improvement. While again the trajectory of the treatment group is similar to the previous cases, the trajectory for the control group is in between the case of no rescue therapy and ignoring rescue therapy when it is present. The treatment effect estimate is thus also in between the previous estimates: $\hat{\beta}_3 = -0.3337$ and $p = 0.0036$. However, the treatment effect estimate is still noticeably reduced from the estimate we would obtain if no one received rescue therapy, so this approach only partially addresses issue arising from rescue therapy. The reason for the divergence in results between the left and right panels is that excluding those with rescue therapy produces MNAR missingness, whereas the LMM assumes MAR missingness.
+     
+## Figure with all 3 panels
+
+```{r, echo=FALSE}
+cbpg <- c("#999999", "#E69F00", "#56B4E9", "#009E73",
+"#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+x_trt <- build_design_matrix(
+  N_t = 1, N_c = 0, K = 3, time_increment = 3
+)
+x_ctrl <- build_design_matrix(
+  N_t = 0, N_c = 1, K = 3, time_increment = 3
+)
+beta_no_censor <- lme_no_censor$coefficients$fixed
+beta_ici <- lme_ici$coefficients$fixed
+beta_ice <- lme_ice$coefficients$fixed
+
+df_plot <- data.frame(
+  MGADL = c(x_trt%*%beta_no_censor,
+            x_ctrl%*%beta_no_censor,
+            x_trt%*%beta_ici,
+            x_ctrl%*%beta_ici,
+            x_trt%*%beta_ice,
+            x_ctrl%*%beta_ice),
+  Time = rep(c(0, 3, 6), 6),
+  Group = factor(
+    rep(c(rep("Treatment", 3), rep("Control", 3)), 3),
+    levels = c("Treatment", "Control")
+    ),
+  Model = factor(
+    c(rep("No Rescue Therapy Administered", 6),
+      rep("Ignore Rescue Therapy", 6),
+      rep("Exclude Rescue Therapy", 6)),
+    levels = c("No Rescue Therapy Administered",
+               "Ignore Rescue Therapy",
+               "Exclude Rescue Therapy")
+  )
+)
+ggplot(
+  df_plot,
+  aes(x = Time,
+      y = MGADL,
+      color = Group)
+) +
+  facet_wrap(~Model) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous("Time (Months)", 
+                     breaks = c(0, 3, 6)) +
+  scale_y_continuous("Estimated MG-ADL") +
+  scale_color_manual(
+    values = c(cbpg[4], cbpg[7])
+  ) +
+  theme(legend.position = "bottom")
+
+## Use this one for exporting the figure
+# ggplot(
+#   df_plot,
+#   aes(x = Time,
+#       y = MGADL,
+#       color = Group)
+# ) +
+#   facet_wrap(~Model) +
+#   geom_point(size = 2) +
+#   geom_line(linewidth = 0.75) +
+#   scale_x_continuous("Time (Months)",
+#                      breaks = c(0, 3, 6)) +
+#   scale_y_continuous("MG-ADL") +
+#   scale_color_manual(
+#     values = c(cbpg[4], cbpg[7])
+#   ) +
+#   theme(legend.position = "bottom",
+#         text=element_text(size=14))
+```
+
+## Figure without "excluding rescue therapy" panel
+
+This is the final figure used in the manuscript.
+
+```{r, echo=FALSE}
+cbpg <- c("#999999", "#E69F00", "#56B4E9", "#009E73",
+"#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+x_trt <- build_design_matrix(
+  N_t = 1, N_c = 0, K = 3, time_increment = 3
+)
+x_ctrl <- build_design_matrix(
+  N_t = 0, N_c = 1, K = 3, time_increment = 3
+)
+beta_no_censor <- lme_no_censor$coefficients$fixed
+beta_ici <- lme_ici$coefficients$fixed
+
+df_plot2 <- data.frame(
+  MGADL = c(x_trt%*%beta_no_censor,
+            x_ctrl%*%beta_no_censor,
+            x_trt%*%beta_ici,
+            x_ctrl%*%beta_ici),
+  Time = rep(c(0, 3, 6), 4),
+  Group = factor(
+    rep(c(rep("Treatment", 3), rep("Control", 3)), 4),
+    levels = c("Treatment", "Control")
+    ),
+  Model = factor(
+    c(rep("(A) No Rescue Therapy Administered", 6),
+      rep("(B) Ignore Rescue Therapy", 6)),
+    levels = c("(A) No Rescue Therapy Administered",
+               "(B) Ignore Rescue Therapy")
+  )
+)
+ggplot(
+  df_plot2,
+  aes(x = Time,
+      y = MGADL,
+      color = Group)
+) +
+  facet_wrap(~Model) +
+  geom_point() +
+  geom_line() +
+  scale_x_continuous("Time (Months)", 
+                     breaks = c(0, 3, 6)) +
+  scale_y_continuous("Estimated MG-ADL") +
+  scale_color_manual(
+    values = c(cbpg[4], cbpg[7])
+  ) +
+  theme(legend.position = "bottom")
+
+## Use this one for exporting the figure
+# ggplot(
+#   df_plot2,
+#   aes(x = Time,
+#       y = MGADL,
+#       color = Group)
+# ) +
+#   facet_wrap(~Model) +
+#   geom_point(size = 2) +
+#   geom_line(linewidth = 0.75) +
+#   scale_x_continuous("Time (Months)",
+#                      breaks = c(0, 3, 6)) +
+#   scale_y_continuous("Estimated MG-ADL") +
+#   scale_color_manual(
+#     values = c(cbpg[4], cbpg[7])
+#   ) +
+#   theme(legend.position = "bottom",
+#         text=element_text(size=16))
+```
